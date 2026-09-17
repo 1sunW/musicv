@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: x8music
+    runtime: node
+    plan: free
+    buildCommand: >-
+      npm install &&
+      curl -L --fail --silent --show-error
+      -o services/soundcloud-backend/yt-dlp
+      https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp &&
+      chmod +x services/soundcloud-backend/yt-dlp &&
+      npm run build
+    startCommand: node render-start.mjs
+    healthCheckPath: /api/music/source
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: YTDLP_PATH
+        value: services/soundcloud-backend/yt-dlp
+      - key: YT_DLP_PATH
+        value: services/soundcloud-backend/yt-dlp
+      - key: SC_DLP_BASES
+        value: http://127.0.0.1:8081
