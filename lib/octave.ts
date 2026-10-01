@@ -23,9 +23,29 @@ function octaveBase(): string {
   );
 }
 
-// Operator escape hatch: skip the whole browser dance and paste a freshly
-// minted token here. Never expires, since we can't see into the upstream.
-const TOKEN_OVERRIDE = process.env.OCTAVE_PBTOKEN || "";
+const badTokens = new Set<string>();
+
+function accountTokenOverride(): string {
+  const accountToken = (
+    process.env.OCTAVE_ACCOUNT_TOKEN ||
+    process.env.OCTAVE_ACCOUNT_KEY ||
+    process.env.OCTAVE_KEY ||
+    ""
+  ).trim();
+  if (accountToken) return accountToken;
+  const pbtoken = (process.env.OCTAVE_PBTOKEN || "").trim();
+  if (pbtoken.startsWith("octv_")) return pbtoken;
+  return "";
+}
+
+function pbTokenOverride(): string {
+  // If an account token is present, always use the account token to mint fresh tokens!
+  if (accountTokenOverride()) return "";
+  const pb = (process.env.OCTAVE_PBTOKEN || "").trim();
+  if (pb.startsWith("octv_")) return ""; // Handled as account token instead
+  if (badTokens.has(pb)) return "";
+  return pb;
+}
 
 const TTL_MS = Number(process.env.OCTAVE_PBTOKEN_TTL_MS) || 12 * 60 * 60 * 1000;
 
@@ -42,14 +62,22 @@ const SCRIPT_RUN_TIMEOUT_MS = 90 * 1000;
 // than hold the play up.
 const SEARCH_TIMEOUT_MS = Number(process.env.OCTAVE_SEARCH_TIMEOUT_MS) || 4000;
 
-const TOKEN_RE = /^octk_[A-Za-z0-9_-]+$/;
+// Octave playback tokens: octk_<base36_expiry>[.<hex>]_<hash>
+const TOKEN_RE = /^octk_[A-Za-z0-9_.-]+$/;
+// Octave account keys: octv_<48 hex chars>
+const ACCOUNT_TOKEN_RE = /^octv_[A-Za-z0-9_.-]+$/;
 
 /**
  * The signing token made it into a URL. Exported so tests (and the status
  * route) can sanity-check without holding a real token.
  */
 export function isOctaveToken(value: string | undefined | null): boolean {
-  return typeof value === "string" && TOKEN_RE.test(value);
+  return typeof value === "string" && TOKEN_RE.test(value.trim());
+}
+
+/** Check if a value is formatted as an Octave account token / key. */
+export function isOctaveAccountToken(value: string | undefined | null): boolean {
+  return typeof value === "string" && ACCOUNT_TOKEN_RE.test(value.trim());
 }
 
 const TOKEN_FILE = path.join(process.cwd(), "data", "octave-pbtoken.json");
@@ -75,7 +103,8 @@ interface Cached { token: string; fetchedAt: number; expiresAt: number }
 // Chromium on every boot is slow and can fail for reasons unrelated to the
 // token having actually expired.
 let cache: Cached | null = (() => {
-  if (TOKEN_OVERRIDE) return null;
+  const directPb = pbTokenOverride();
+  if (directPb && isOctaveToken(directPb)) return null;
   try {
     const c = JSON.parse(readFileSync(TOKEN_FILE, "utf-8")) as Cached;
     if (c?.token && isOctaveToken(c.token) && Date.now() < c.expiresAt) return c;
@@ -93,6 +122,51 @@ function persistCache() {
   } catch {
     // A read-only data dir just means the token is refetched after a restart.
   }
+}
+
+async function fetchTokenFromAccount(accountKey: string): Promise<MintedToken> {
+  const url = `${octaveBase()}/api/playback-token`;
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${accountKey.trim()}`,
+      Origin: "https://music.octavestreaming.com",
+      Referer: "https://music.octavestreaming.com/",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    },
+    signal: AbortSignal.timeout(10000),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `Octave /api/playback-token returned HTTP ${res.status}: ${body}`,
+    );
+  }
+
+  const data = (await res.json()) as {
+    token?: string | null;
+    expiresIn?: number;
+    gated?: boolean;
+    reason?: string;
+  };
+
+  if (!data?.token || !isOctaveToken(data.token)) {
+    throw new Error(
+      `Octave account key failed to mint playback token: ${JSON.stringify(data)}`,
+    );
+  }
+
+  const expiresIn =
+    typeof data.expiresIn === "number" && data.expiresIn > 0
+      ? data.expiresIn
+      : 3600;
+
+  return {
+    token: data.token,
+    exp: Math.floor(Date.now() / 1000) + expiresIn,
+    skew: Math.min(3600, Math.max(30, Math.floor(expiresIn / 3))),
+  };
 }
 
 function runScript(): Promise<string> {
@@ -159,7 +233,7 @@ export function parseTokenOutput(out: string): MintedToken | null {
       // Not JSON — fall through to the bare-token scan.
     }
   }
-  const bare = out.match(/octk_[A-Za-z0-9_-]+/);
+  const bare = out.match(/octk_[A-Za-z0-9_.-]+/);
   if (bare && isOctaveToken(bare[0])) return { token: bare[0], exp: null, skew: null };
   return null;
 }
@@ -169,35 +243,43 @@ export function parseTokenOutput(out: string): MintedToken | null {
 let inFlight: Promise<string> | null = null;
 let lastFetchFailedAt = 0;
 
-async function fetchToken(): Promise<string> {
-  if (TOKEN_OVERRIDE) return TOKEN_OVERRIDE;
+async function fetchToken(explicitAccountKey?: string): Promise<string> {
+  const directPb = pbTokenOverride();
+  if (directPb && isOctaveToken(directPb)) return directPb;
   if (inFlight) return inFlight;
-  inFlight = runScript()
-    .then((out) => {
-      const minted = parseTokenOutput(out);
+
+  const accountKey = explicitAccountKey || accountTokenOverride();
+
+  inFlight = (async () => {
+    let minted: MintedToken | null = null;
+    if (accountKey) {
+      minted = await fetchTokenFromAccount(accountKey);
+    } else {
+      const out = await runScript();
+      minted = parseTokenOutput(out);
       if (!minted) {
         throw new Error(
           `no octk_ token in script output: ${out.trim().slice(-400)}`,
         );
       }
-      // Trust the upstream's own expiry (net of its safety skew) when it told
-      // us one, but never extend past our local cap — a token we can't reason
-      // about should be refreshed sooner, not later.
-      let expiresAt = Date.now() + TTL_MS;
-      if (typeof minted.exp === "number") {
-        const skewMs = typeof minted.skew === "number" ? minted.skew * 1000 : 0;
-        const upstreamMs = minted.exp * 1000 - skewMs;
-        expiresAt = Math.min(expiresAt, upstreamMs);
-      }
-      // A freshly minted token is usable for a least a minute; without this
-      // floor, an upstream exp that's already in the past would make every
-      // play relaunch the browser only to get another dead token.
-      expiresAt = Math.max(expiresAt, Date.now() + 60_000);
-      cache = { token: minted.token, fetchedAt: Date.now(), expiresAt };
-      persistCache();
-      lastFetchFailedAt = 0;
-      return minted.token;
-    })
+    }
+
+    // Trust the upstream's own expiry (net of its safety skew) when it told
+    // us one, but never extend past our local cap — a token we can't reason
+    // about should be refreshed sooner, not later.
+    let expiresAt = Date.now() + TTL_MS;
+    if (typeof minted.exp === "number") {
+      const skewMs = typeof minted.skew === "number" ? minted.skew * 1000 : 0;
+      const upstreamMs = minted.exp * 1000 - skewMs;
+      expiresAt = Math.min(expiresAt, upstreamMs);
+    }
+    // A freshly minted token is usable for at least a minute.
+    expiresAt = Math.max(expiresAt, Date.now() + 60_000);
+    cache = { token: minted.token, fetchedAt: Date.now(), expiresAt };
+    persistCache();
+    lastFetchFailedAt = 0;
+    return minted.token;
+  })()
     .catch((err) => {
       lastFetchFailedAt = Date.now();
       throw err;
@@ -205,6 +287,7 @@ async function fetchToken(): Promise<string> {
     .finally(() => {
       inFlight = null;
     });
+
   return inFlight;
 }
 
@@ -213,37 +296,54 @@ async function fetchToken(): Promise<string> {
  * null when no token is (yet) available instead of throwing, so callers can
  * pick a fallback source quietly.
  */
-export async function getOctaveToken(): Promise<string | null> {
-  if (TOKEN_OVERRIDE) return TOKEN_OVERRIDE;
+export async function getOctaveToken(
+  explicitAccountKey?: string,
+): Promise<string | null> {
+  const directPb = pbTokenOverride();
+  if (directPb && isOctaveToken(directPb)) return directPb;
   if (cache && Date.now() < cache.expiresAt) return cache.token;
   if (Date.now() - lastFetchFailedAt < RETRY_COOLDOWN_MS) return null;
   try {
-    return await fetchToken();
+    return await fetchToken(explicitAccountKey);
   } catch (e) {
-    console.error("[octave] playback token fetch failed:", e instanceof Error ? e.message : e);
+    console.warn(
+      "[octave] playback token fetch failed (will use fallback):",
+      e instanceof Error ? e.message : e,
+    );
     return null;
   }
 }
 
 /** Drop any cached/on-disk token now — used when a stream comes back 401/403. */
-export function invalidateOctaveToken(): void {
+export function invalidateOctaveToken(rejectedToken?: string): void {
+  if (rejectedToken) badTokens.add(rejectedToken.trim());
+  if (cache?.token) badTokens.add(cache.token);
   cache = null;
   try {
-    writeFileSync(TOKEN_FILE, JSON.stringify({ token: "", fetchedAt: 0, expiresAt: 0 }));
+    writeFileSync(
+      TOKEN_FILE,
+      JSON.stringify({ token: "", fetchedAt: 0, expiresAt: 0 }),
+    );
   } catch {
     // Best effort; the in-memory state is what matters.
   }
 }
 
 /** Force a refresh (status route / operator) and return the new token or null. */
-export async function refreshOctaveToken(): Promise<string | null> {
-  if (TOKEN_OVERRIDE) return TOKEN_OVERRIDE;
+export async function refreshOctaveToken(
+  explicitAccountKey?: string,
+): Promise<string | null> {
+  const directPb = pbTokenOverride();
+  if (directPb && isOctaveToken(directPb)) return directPb;
   cache = null;
   lastFetchFailedAt = 0;
   try {
-    return await fetchToken();
+    return await fetchToken(explicitAccountKey);
   } catch (e) {
-    console.error("[octave] playback token refresh failed:", e instanceof Error ? e.message : e);
+    console.error(
+      "[octave] playback token refresh failed:",
+      e instanceof Error ? e.message : e,
+    );
     return null;
   }
 }
@@ -251,16 +351,30 @@ export async function refreshOctaveToken(): Promise<string | null> {
 export function octaveStatus(): {
   base: string;
   hasToken: boolean;
-  source: "env" | "cache" | "none";
+  source: "account" | "env" | "cache" | "none";
+  hasAccountKey: boolean;
   fetchedAt: number | null;
   expiresAt: number | null;
   retryInMs: number;
 } {
-  const retryInMs = Math.max(0, lastFetchFailedAt + RETRY_COOLDOWN_MS - Date.now());
+  const retryInMs = Math.max(
+    0,
+    lastFetchFailedAt + RETRY_COOLDOWN_MS - Date.now(),
+  );
+  const accountKey = accountTokenOverride();
+  const directPb = pbTokenOverride();
+  const source = directPb
+    ? "env"
+    : accountKey && cache
+      ? "account"
+      : cache
+        ? "cache"
+        : "none";
   return {
     base: octaveBase(),
-    hasToken: !!TOKEN_OVERRIDE || (!!cache && Date.now() < cache.expiresAt),
-    source: TOKEN_OVERRIDE ? "env" : cache ? "cache" : "none",
+    hasToken: !!directPb || (!!cache && Date.now() < cache.expiresAt),
+    source,
+    hasAccountKey: !!accountKey,
     fetchedAt: cache?.fetchedAt ?? null,
     expiresAt: cache?.expiresAt ?? null,
     retryInMs,

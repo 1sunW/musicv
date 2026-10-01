@@ -16,6 +16,8 @@ import {
   buildOctaveStreamUrl,
   getOctaveToken,
   invalidateOctaveToken,
+  isOctaveAccountToken,
+  isOctaveToken,
   octaveScriptPath,
   octaveStatus,
   refreshOctaveToken,
@@ -283,8 +285,8 @@ const STREAM_ONLY_SOURCES: ReadonlySet<SourcePriority> = new Set([
  * ties in the UI — but it is the one place the intended ranking is written
  * down, so keep it in sync with the picker in Music.tsx. */
 const SOURCE_ORDER: SourcePriority[] = [
-  "tidal",
   "octave",
+  "tidal",
   "monochrome",
   "qobuz",
   "scdlp",
@@ -293,7 +295,7 @@ const SOURCE_ORDER: SourcePriority[] = [
   "youtube",
 ];
 
-let currentSourcePriority: SourcePriority = "tidal";
+let currentSourcePriority: SourcePriority = "octave";
 const sourceLatencies: Map<SourcePriority, number> = new Map();
 let lastPingTime = 0;
 
@@ -755,7 +757,10 @@ async function testSourceLatency(source: SourcePriority): Promise<number> {
     sourceLatencies.set(source, latency);
     return latency;
   } catch (err) {
-    console.log(`${source} ping failed:`, err);
+    console.warn(
+      `[SourcePing] ${source} unavailable:`,
+      err instanceof Error ? err.message : String(err),
+    );
     sourceLatencies.set(source, Infinity);
     return Infinity;
   }
@@ -765,7 +770,17 @@ async function probeSource(source: SourcePriority): Promise<void> {
   {
     switch (source) {
       case "tidal": {
-        await tidalSearchTracks("test", 1);
+        let tidalOk = false;
+        try {
+          await tidalSearchTracks("test", 1);
+          tidalOk = true;
+        } catch {
+          try {
+            await callMusicApi("/search/", { s: "test", limit: 1 });
+            tidalOk = true;
+          } catch {}
+        }
+        if (!tidalOk) throw new Error("No Tidal endpoint responded");
         break;
       }
       case "qobuz": {
@@ -788,7 +803,7 @@ async function probeSource(source: SourcePriority): Promise<void> {
       }
       case "soundcloud": {
         const clientId = await getValidClientId();
-        const url = new URL("https://api-v2.soundcloud.com/tracks");
+        const url = new URL("https://api-v2.soundcloud.com/search/tracks");
         url.searchParams.set("client_id", clientId);
         url.searchParams.set("q", "test");
         url.searchParams.set("limit", "1");
@@ -922,7 +937,7 @@ async function searchWithPriority(
         results = await qobuzSearch(query, limit);
       } else if (source === "soundcloud") {
         const data = await soundcloudApiRequest<SoundcloudSearchResp>(
-          "/tracks",
+          "/search/tracks",
           {
             q: query,
             limit: limit,
@@ -988,7 +1003,12 @@ async function resolveFromSource(
     // (slow) browser launch to fetch a token it won't get to use.
     if (sourceHint !== "tidal" && sourceHint !== "octave")
       throw new Error("Octave is only raced for Tidal-sourced tracks");
-    const token = octaveToken || (await getOctaveToken());
+    const explicitAccount =
+      octaveToken && isOctaveAccountToken(octaveToken) ? octaveToken : undefined;
+    const token =
+      octaveToken && isOctaveToken(octaveToken)
+        ? octaveToken
+        : await getOctaveToken(explicitAccount);
     if (!token) throw new Error("No Octave playback token");
     // `id` is Tidal's, and Octave's id space is unrelated to it — passing it
     // straight through made /audio/320 spend ~15s looking for a track that
@@ -1033,7 +1053,7 @@ async function resolveFromSource(
     let scTrackId: number;
     if (sourceHint !== "soundcloud" && meta?.artist && meta?.title) {
       const scResults = await soundcloudApiRequest<SoundcloudSearchResp>(
-        "/tracks",
+        "/search/tracks",
         {
           q: `${meta.artist} ${meta.title}`,
           limit: 5,
@@ -1216,12 +1236,17 @@ async function assertPlayable(
   if (result.rawDash) {
     const declared = /mediaPresentationDuration="([^"]+)"/.exec(result.rawDash);
     const seconds = declared ? parseIsoDuration(declared[1]) : null;
-    // Only call it a preview when we know the real length and the manifest is
-    // dramatically shorter, so genuinely short tracks aren't rejected.
-    if (seconds !== null && meta?.duration && meta.duration > 60) {
-      if (seconds < meta.duration * 0.5) {
+    // Reject 30-second previews (common on un-entitled Tidal streams)
+    // so the fallback race moves on to full-length audio providers.
+    if (seconds !== null) {
+      if (meta?.duration && meta.duration > 35 && seconds < meta.duration * 0.75) {
         throw new Error(
           `preview only (${Math.round(seconds)}s of ${Math.round(meta.duration)}s)`,
+        );
+      }
+      if (seconds <= 31 && (!meta?.duration || meta.duration > 35)) {
+        throw new Error(
+          `preview only (${Math.round(seconds)}s manifest)`,
         );
       }
     }
@@ -1246,7 +1271,12 @@ async function assertPlayable(
       // to: the probe retried every 6s since is useless, so drop the cached
       // token now and let the next play mint a fresh one.
       if (result.source === "octave" && (probe.status === 401 || probe.status === 403)) {
-        invalidateOctaveToken();
+        try {
+          const badK = new URL(result.url).searchParams.get("k") || undefined;
+          invalidateOctaveToken(badK);
+        } catch {
+          invalidateOctaveToken();
+        }
       }
       throw new Error(`upstream returned ${probe.status}`);
     }
@@ -1850,12 +1880,10 @@ export async function musicRoutes(fastify: FastifyInstance) {
     const sourceToUse = source || currentSourcePriority;
     const lim = parseInt(limit ?? "30");
 
-    if (sourceToUse === "tidal") {
+    if (sourceToUse === "tidal" || sourceToUse === "octave") {
       try {
         let trackItems: TidalTrack[] = [];
-
         let albumItems: any[] = [];
-
         let artistItems: any[] = [];
 
         const combined = await callMusicApi<unknown>("/search/", {
@@ -1878,7 +1906,7 @@ export async function musicRoutes(fastify: FastifyInstance) {
               }),
               callMusicApi<unknown>("/search/", {
                 a: q.trim(),
-                limit: Math.min(lim, 12),
+                limit: Math.min(lim, 16),
               }),
             ]);
 
@@ -1900,16 +1928,19 @@ export async function musicRoutes(fastify: FastifyInstance) {
         }
 
         const tracks: ClientTrack[] = trackItems
-          .map((t) => toClientTrack(t))
+          .map((t) => ({
+            ...toClientTrack(t),
+            source: sourceToUse === "octave" ? ("octave" as const) : ("tidal" as const),
+          }))
           .slice(0, lim);
 
         const albums: ClientAlbum[] = albumItems
           .map((a: any) => toClientAlbum(a))
-          .slice(0, 12);
+          .slice(0, 24);
 
         const artists: ClientArtist[] = artistItems
           .map((a: any) => toClientArtist(a))
-          .slice(0, 12);
+          .slice(0, 24);
 
         if (tracks.length > 0 || albums.length > 0 || artists.length > 0) {
           reply.header("cache-control", "public, max-age=120");
@@ -1917,7 +1948,7 @@ export async function musicRoutes(fastify: FastifyInstance) {
             items: tracks,
             albums,
             artists,
-            source: "tidal",
+            source: sourceToUse,
           });
         }
       } catch {}
@@ -2222,10 +2253,7 @@ export async function musicRoutes(fastify: FastifyInstance) {
     if (contentLength) reply.header("content-length", contentLength);
     const contentRange = upstream.headers.get("content-range");
     if (contentRange) reply.header("content-range", contentRange);
-    reply.header(
-      "accept-ranges",
-      upstream.headers.get("accept-ranges") || "bytes",
-    );
+    reply.header("accept-ranges", "bytes");
     reply.header("cache-control", "no-store");
 
     if (!upstream.body) return reply.send();

@@ -9,8 +9,7 @@ const CLIENT_SECRET =
 const COUNTRY = process.env.TIDAL_COUNTRY || "US";
 // api.tidal.com geo-blocks datacenter IPs; the proxy is what lets the
 // client-credentials token reach playbackinfo (Monochrome uses the same one).
-const TIDAL_PROXY =
-  process.env.TIDAL_PROXY || "https://td.if-it-runs-ship-it.lol/api";
+const TIDAL_PROXY = process.env.TIDAL_PROXY || "";
 
 const TIMEOUT_MS = Number(process.env.TIDAL_TIMEOUT_MS) || 8000;
 
@@ -42,6 +41,8 @@ async function getToken(): Promise<string> {
   return cachedToken.value;
 }
 
+let proxyDisabled = false;
+
 async function tidalApi<T>(
   path: string,
   params: Record<string, string | number | undefined> = {},
@@ -51,7 +52,10 @@ async function tidalApi<T>(
   u.searchParams.set("countryCode", COUNTRY);
   for (const [k, v] of Object.entries(params))
     if (v !== undefined) u.searchParams.set(k, String(v));
-  const url = u.toString().replace("https://api.tidal.com", TIDAL_PROXY);
+  const url =
+    TIDAL_PROXY && !proxyDisabled
+      ? u.toString().replace("https://api.tidal.com", TIDAL_PROXY)
+      : u.toString();
 
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
@@ -62,6 +66,22 @@ async function tidalApi<T>(
     });
     if (!res.ok) throw new Error(`Tidal ${path} → ${res.status}`);
     return (await res.json()) as T;
+  } catch (err: any) {
+    if (
+      TIDAL_PROXY &&
+      !proxyDisabled &&
+      (err?.code === "ENOTFOUND" || err?.cause?.code === "ENOTFOUND")
+    ) {
+      console.warn(`[tidal] TIDAL_PROXY host not found, disabling proxy:`, TIDAL_PROXY);
+      proxyDisabled = true;
+      const res = await fetch(u.toString(), {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+      if (!res.ok) throw new Error(`Tidal ${path} → ${res.status}`);
+      return (await res.json()) as T;
+    }
+    throw err;
   } finally {
     clearTimeout(t);
   }

@@ -1,0 +1,8 @@
+{
+  "name": "x8music",
+  "description": "Multi-source music search and audio streaming player supporting Tidal, Qobuz, SoundCloud, Deezer, and YouTube.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
