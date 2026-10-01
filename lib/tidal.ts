@@ -9,7 +9,8 @@ const CLIENT_SECRET =
 const COUNTRY = process.env.TIDAL_COUNTRY || "US";
 // api.tidal.com geo-blocks datacenter IPs; the proxy is what lets the
 // client-credentials token reach playbackinfo (Monochrome uses the same one).
-const TIDAL_PROXY = process.env.TIDAL_PROXY || "";
+const rawProxy = (process.env.TIDAL_PROXY || "").trim();
+const TIDAL_PROXY = rawProxy.includes("if-it-runs-ship-it.lol") ? "" : rawProxy;
 
 const TIMEOUT_MS = Number(process.env.TIDAL_TIMEOUT_MS) || 8000;
 

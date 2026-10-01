@@ -39,8 +39,13 @@ const fastify = Fastify({ logger: { level: "info" } });
 
 // Start the auxiliary SoundCloud backend if present
 try {
-  const scScript = path.join(__dirname, "services", "soundcloud-backend", "server.js");
-  if (existsSync(scScript)) {
+  const scScriptCandidates = [
+    path.join(__dirname, "services", "soundcloud-backend", "server.js"),
+    path.join(__dirname, "..", "services", "soundcloud-backend", "server.js"),
+    path.join(process.cwd(), "services", "soundcloud-backend", "server.js"),
+  ];
+  const scScript = scScriptCandidates.find((p) => existsSync(p));
+  if (scScript) {
     const scProc = spawn(process.execPath, [scScript], {
       env: { ...process.env, PORT: "8081", SC_HOST: "127.0.0.1" },
       stdio: "ignore",

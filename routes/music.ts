@@ -1,6 +1,7 @@
 import { FastifyInstance, FastifyReply } from "fastify";
 import { Readable } from "node:stream";
 import { promises as fsp, constants as fsConstants } from "node:fs";
+import path from "node:path";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import { tidalSearchTracks } from "../lib/tidal.js";
 import {
@@ -1705,7 +1706,11 @@ function resolveYtDlpPath(): Promise<string | null> {
       };
       const candidates = [
         process.env.YT_DLP_PATH,
+        process.env.YTDLP_PATH,
         mod.constants?.YOUTUBE_DL_PATH,
+        path.join(process.cwd(), "services", "soundcloud-backend", "yt-dlp"),
+        path.join(__dirname, "services", "soundcloud-backend", "yt-dlp"),
+        path.join(__dirname, "..", "services", "soundcloud-backend", "yt-dlp"),
         "/usr/local/bin/yt-dlp",
         "/usr/bin/yt-dlp",
       ].filter((p): p is string => !!p);
