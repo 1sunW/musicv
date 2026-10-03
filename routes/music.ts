@@ -1320,7 +1320,7 @@ async function resolveStreamWithFallback(
   // playable* stream wins — no quality tiers, no sequential fallback. A source
   // that needs an ISRC it wasn't given rejects immediately and costs nothing.
   const isOctavePick = sourceHint === "octave";
-  const candidateAllowed = (s: SourcePriority): boolean => {
+  const candidateAllowed = (s: SourcePriority, isFallbackPass = false): boolean => {
     if ((s === "qobuz" || s === "deezer") && !isrc) return false;
     if (s === "scdlp" && SCDLP_BASES.length === 0) return false;
     // Costs a round trip to learn what we already know locally: without a
@@ -1334,11 +1334,11 @@ async function resolveStreamWithFallback(
     // Picking Octave in the UI means the stream *should* come from Octave, so
     // this pass races octave alone — the fallback below re-races everything
     // else only when octave outright fails.
-    if (isOctavePick && s !== "octave") return false;
+    if (!isFallbackPass && isOctavePick && s !== "octave") return false;
     return true;
   };
 
-  const candidates = SOURCE_ORDER.filter(candidateAllowed);
+  const candidates = SOURCE_ORDER.filter((s) => candidateAllowed(s, false));
 
   if (candidates.length === 0) throw new Error("No usable stream sources");
 
@@ -1349,7 +1349,7 @@ async function resolveStreamWithFallback(
     // missing token, upstream down), re-race the rest so the play survives.
     if (isOctavePick) {
       const rest = SOURCE_ORDER.filter(
-        (s) => s !== "octave" && candidateAllowed(s),
+        (s) => s !== "octave" && candidateAllowed(s, true),
       );
       if (rest.length > 0) {
         try {

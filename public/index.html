@@ -1757,10 +1757,11 @@ function playTrack(track) {
   playerLikeBtn.className = `action-btn ${isLiked ? 'liked' : ''}`;
   playerLikeBtn.querySelector('svg').setAttribute('fill', isLiked ? 'currentColor' : 'none');
 
-  // Build audio stream URL (Octave default with automatic server fallback)
+  // Build audio stream URL with automatic server fallback
   const params = new URLSearchParams({ id: String(track.id) });
   if (track.isrc) params.set('isrc', track.isrc);
-  params.set('source', track.source || 'octave');
+  if (track.source) params.set('source', track.source);
+  else if (state.currentSource && state.currentSource !== 'auto') params.set('source', state.currentSource);
   if (track.title) params.set('title', track.title);
   if (track.artist) params.set('artist', track.artist);
   if (track.duration) params.set('duration', String(track.duration));
@@ -1768,9 +1769,10 @@ function playTrack(track) {
   audio.src = '/api/music/stream?' + params.toString();
   audio.play().then(() => {
     updatePlayState(true);
-  }).catch(() => {
+  }).catch((err) => {
     updatePlayState(false);
-    showToast('Failed to start audio stream. Retrying fallback...');
+    console.warn('Playback start failed:', err);
+    showToast('Failed to start audio stream. Check source or try another track.');
   });
 
   // Highlight in rows
@@ -1795,6 +1797,11 @@ function updatePlayState(playing) {
   pauseIcon.style.display = playing ? 'block' : 'none';
 }
 
+audio.addEventListener('error', () => {
+  updatePlayState(false);
+  showToast('Audio playback error (502 or stream unavailable).');
+});
+
 playBtn.addEventListener('click', () => {
   if (!state.currentTrack) {
     if (state.queue.length > 0) {
@@ -1804,8 +1811,13 @@ playBtn.addEventListener('click', () => {
     return;
   }
   if (audio.paused) {
-    audio.play();
-    updatePlayState(true);
+    audio.play().then(() => {
+      updatePlayState(true);
+    }).catch((err) => {
+      console.warn('Manual play resume failed:', err);
+      updatePlayState(false);
+      showToast('Could not resume stream.');
+    });
   } else {
     audio.pause();
     updatePlayState(false);
